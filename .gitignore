@@ -18,7 +18,4 @@ coverage/
 
 # Local convention and community files
 AGENTS.md
-CODE_OF_CONDUCT.md
-CONTRIBUTING.md
-SECURITY.md
 .github/
