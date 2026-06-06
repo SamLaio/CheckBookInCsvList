@@ -1,0 +1,24 @@
+.DS_Store
+Thumbs.db
+
+.history/
+.vscode/
+.idea/
+.vs/
+
+*.log
+*.tmp
+*.bak
+*.original
+
+node_modules/
+dist/
+build/
+coverage/
+
+# Local convention and community files
+AGENTS.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+SECURITY.md
+.github/
