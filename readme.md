@@ -73,6 +73,26 @@ const CONFIG_OPDS = {
 };
 ```
 
+Talebook / Calibre-Web 類型的 OPDS 搜尋端點通常可以這樣填：
+
+```js
+const CONFIG_OPDS = {
+    searchUrl: 'https://your-opds-host.example.com/opds/your-token?feed=search&query={query}',
+    username: '',
+    password: '',
+    maxResults: 8
+};
+```
+
+請保留 `{query}` 佔位符，腳本會把你在網頁上選取的文字 URL encode 後放進去。若你的 OPDS 服務需要 Basic Auth，帳號密碼會直接存在 userscript 原始碼中，請只用在你信任且不會公開分享的腳本副本。
+
+### OPDS 查詢失敗排查
+
+- 確認 `CONFIG_SEARCH_MODE` 是 `'opds'`。
+- 確認 `CONFIG_OPDS.searchUrl` 可以在瀏覽器直接開啟，且搜尋參數包含 `{query}`。
+- 若錯誤訊息提到 `@connect`，請確認 metadata 內有允許該 OPDS 網域，例如 `// @connect your-opds-host.example.com`，或重新儲存 / 重新安裝腳本讓 Tampermonkey 更新權限。
+- 若出現 HTTP 狀態碼，請依狀態碼檢查登入權限、token、反向代理或伺服器設定。
+
 ---
 
 ## 📖 使用教學

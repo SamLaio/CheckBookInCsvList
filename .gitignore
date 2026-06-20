@@ -19,3 +19,4 @@ coverage/
 # Local convention and community files
 AGENTS.md
 .github/
+RELEASE_NOTES_*.md

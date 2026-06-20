@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         書庫數據比對工具
 // @namespace    http://tampermonkey.net/
-// @version      1.8
+// @version      1.10
 // @description  選取文字後使用 CSV 或 OPDS 查詢書庫資料
 // @author       Gemini
 // @match        *://*/*
@@ -47,6 +47,8 @@
 (function() {
     'use strict';
 
+    const SCRIPT_VERSION = '1.10';
+
     // ==========================================
     // ⚙️ 使用者設定區塊 (User Settings)
     // ==========================================
@@ -79,7 +81,7 @@
         primaryColor: '#1a73e8',       // 按鈕與標題的主題顏色
         panelWidth: '380px',           // 彈窗寬度
         maxResults: 8,                 // 搜尋結果顯示上限
-        panelTitle: '📘 書庫比對結果'
+        panelTitle: `📘 書庫比對結果 v${SCRIPT_VERSION}`
     };
 
     // ==========================================
@@ -139,13 +141,12 @@
     loadCloudData();
 
     function escapeHtml(value) {
-        return String(value ?? '').replace(/[&<>"']/g, (char) => ({
-            '&': '&amp;',
-            '<': '&lt;',
-            '>': '&gt;',
-            '"': '&quot;',
-            "'": '&#39;'
-        }[char]));
+        return String(value ?? '')
+            .replaceAll('&', '&amp;')
+            .replaceAll('<', '&lt;')
+            .replaceAll('>', '&gt;')
+            .replaceAll('"', '&quot;')
+            .replaceAll("'", '&#39;');
     }
 
     function buildOpdsSearchUrl(query) {
@@ -166,17 +167,35 @@
         return headers;
     }
 
+    function getResponseHeader(responseHeaders, headerName) {
+        const targetName = headerName.toLowerCase();
+        const lines = String(responseHeaders || '').split('\n');
+        const headerLine = lines.find((line) => line.toLowerCase().startsWith(`${targetName}:`));
+        if (!headerLine) return '';
+        return headerLine.slice(headerLine.indexOf(':') + 1).trim();
+    }
+
     function requestOpds(url) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: 'GET',
                 url,
                 headers: getOpdsHeaders(),
-                onload: (response) => resolve({
-                    body: response.responseText,
-                    contentType: response.responseHeaders.match(/content-type:\s*([^\r\n]+)/i)?.[1] || ''
-                }),
-                onerror: () => reject(new Error('OPDS 查詢失敗'))
+                timeout: 20000,
+                onload: (response) => {
+                    const status = Number(response.status || 0);
+                    if (status < 200 || status >= 300) {
+                        reject(new Error(`HTTP ${status || '未知狀態'}`));
+                        return;
+                    }
+
+                    resolve({
+                        body: response.responseText || '',
+                        contentType: getResponseHeader(response.responseHeaders, 'content-type')
+                    });
+                },
+                onerror: () => reject(new Error('網路錯誤或 @connect 未允許此網域')),
+                ontimeout: () => reject(new Error('連線逾時'))
             });
         });
     }
@@ -211,33 +230,123 @@
         }).filter((item) => item.title);
     }
 
-    function parseOpdsXml(body) {
-        const documentXml = new DOMParser().parseFromString(body, 'application/xml');
-        const entries = Array.from(documentXml.getElementsByTagName('entry'));
-        return entries.map((entry) => {
-            const title = entry.getElementsByTagName('title')[0]?.textContent || '';
-            const authorNames = Array.from(entry.getElementsByTagName('author'))
-                .map((author) => author.getElementsByTagName('name')[0]?.textContent || author.textContent)
-                .filter(Boolean);
-            const identifiers = Array.from(entry.getElementsByTagNameNS('*', 'identifier'));
-            const links = Array.from(entry.getElementsByTagName('link'));
-            const acquisitionLink = links.find((link) => (link.getAttribute('rel') || '').includes('acquisition')) || links[0];
+    function decodeXmlText(value) {
+        return String(value || '')
+            .replaceAll('&lt;', '<')
+            .replaceAll('&gt;', '>')
+            .replaceAll('&quot;', '"')
+            .replaceAll('&apos;', "'")
+            .replaceAll('&amp;', '&')
+            .trim();
+    }
 
-            return {
-                title,
-                authors: authorNames.join(', '),
-                isbn: identifiers[0]?.textContent || '',
-                link: acquisitionLink?.getAttribute('href') || ''
+    function getXmlTagText(block, tagName) {
+        const openTagStart = block.indexOf(`<${tagName}`);
+        if (openTagStart === -1) return '';
+
+        const openTagEnd = block.indexOf('>', openTagStart);
+        if (openTagEnd === -1) return '';
+
+        const closeTag = `</${tagName}>`;
+        const closeTagStart = block.indexOf(closeTag, openTagEnd + 1);
+        if (closeTagStart === -1) return '';
+
+        return decodeXmlText(block.slice(openTagEnd + 1, closeTagStart));
+    }
+
+    function getXmlAttribute(tagText, attributeName) {
+        const attributeStart = tagText.indexOf(`${attributeName}=`);
+        if (attributeStart === -1) return '';
+
+        const quoteStart = attributeStart + attributeName.length + 1;
+        const quote = tagText[quoteStart];
+        if (quote !== '"' && quote !== "'") return '';
+
+        const valueStart = quoteStart + 1;
+        const valueEnd = tagText.indexOf(quote, valueStart);
+        if (valueEnd === -1) return '';
+
+        return decodeXmlText(tagText.slice(valueStart, valueEnd));
+    }
+
+    function findXmlLink(block, preferAcquisition) {
+        let cursor = 0;
+        let fallback = '';
+
+        while (cursor < block.length) {
+            const linkStart = block.indexOf('<link', cursor);
+            if (linkStart === -1) break;
+
+            const linkEnd = block.indexOf('>', linkStart);
+            if (linkEnd === -1) break;
+
+            const linkTag = block.slice(linkStart, linkEnd + 1);
+            const href = getXmlAttribute(linkTag, 'href');
+            const rel = getXmlAttribute(linkTag, 'rel');
+            if (href && !fallback) fallback = href;
+            if (href && (!preferAcquisition || rel.includes('acquisition'))) return href;
+
+            cursor = linkEnd + 1;
+        }
+
+        return fallback;
+    }
+
+    function parseOpdsXmlFallback(body) {
+        const items = [];
+        let cursor = 0;
+
+        while (cursor < body.length) {
+            const entryStart = body.indexOf('<entry', cursor);
+            if (entryStart === -1) break;
+
+            const entryOpenEnd = body.indexOf('>', entryStart);
+            const entryEnd = body.indexOf('</entry>', entryOpenEnd + 1);
+            if (entryOpenEnd === -1 || entryEnd === -1) break;
+
+            const entry = body.slice(entryOpenEnd + 1, entryEnd);
+            const authorBlock = getXmlTagText(entry, 'author');
+            const item = {
+                title: getXmlTagText(entry, 'title'),
+                authors: getXmlTagText(authorBlock, 'name') || decodeXmlText(authorBlock),
+                isbn: getXmlTagText(entry, 'dc:identifier') || getXmlTagText(entry, 'identifier'),
+                link: findXmlLink(entry, true)
             };
-        }).filter((item) => item.title);
+
+            if (item.title) items.push(item);
+            cursor = entryEnd + 8;
+        }
+
+        return items;
+    }
+
+    function parseOpdsXml(body) {
+        const fallbackItems = parseOpdsXmlFallback(body);
+        if (fallbackItems.length > 0 || body.includes('<feed')) return fallbackItems;
+
+        throw new Error(`OPDS XML 格式不支援或無法解析：${body.slice(0, 120)}`);
     }
 
     function parseOpdsResponse(body, contentType) {
         const trimmedBody = body.trim();
-        if (contentType.includes('json') || trimmedBody.startsWith('{') || trimmedBody.startsWith('[')) {
-            return parseOpdsJson(trimmedBody);
+        if (!trimmedBody) {
+            throw new Error('OPDS 回應是空白內容');
         }
-        return parseOpdsXml(trimmedBody);
+
+        try {
+            if (contentType.includes('json') || trimmedBody.startsWith('{') || trimmedBody.startsWith('[')) {
+                return parseOpdsJson(trimmedBody);
+            }
+            return parseOpdsXml(trimmedBody);
+        } catch (error) {
+            const fallbackItems = parseOpdsXmlFallback(trimmedBody);
+            if (fallbackItems.length > 0 || trimmedBody.includes('<feed')) {
+                console.warn('OPDS 解析失敗，已改用容錯 XML 解析。', error);
+                return fallbackItems;
+            }
+
+            throw error;
+        }
     }
 
     async function searchOpds(query) {
@@ -245,15 +354,19 @@
             return { state: 'skipped', items: [] };
         }
 
+        let stage = '建立查詢網址';
         try {
-            const response = await requestOpds(buildOpdsSearchUrl(query));
+            const url = buildOpdsSearchUrl(query);
+            stage = '送出 OPDS 請求';
+            const response = await requestOpds(url);
+            stage = '解析 OPDS 回應';
             return {
                 state: 'ready',
                 items: parseOpdsResponse(response.body, response.contentType).slice(0, CONFIG_OPDS.maxResults)
             };
         } catch (error) {
             console.error(error);
-            return { state: 'error', items: [] };
+            return { state: 'error', items: [], message: `v${SCRIPT_VERSION} ${stage}失敗：${error.message || '未知錯誤'}` };
         }
     }
 
@@ -339,19 +452,79 @@
     };
     document.onmouseup = () => isDragging = false;
 
+    function getSelectionText() {
+        return window.getSelection()?.toString().trim() || '';
+    }
+
+    function getSelectionRect(selection) {
+        if (!selection || selection.rangeCount === 0) return null;
+
+        const range = selection.getRangeAt(0);
+        const rect = range.getBoundingClientRect();
+        if (rect.width > 0 || rect.height > 0) return rect;
+
+        return Array.from(range.getClientRects()).find((item) => item.width > 0 || item.height > 0) || null;
+    }
+
+    function isSelectionInsideTool(selection) {
+        const node = selection?.anchorNode;
+        const element = node?.nodeType === 1 ? node : node?.parentElement;
+        return Boolean(element && (btn.contains(element) || panel.contains(element)));
+    }
+
+    function clampPosition(value, min, max) {
+        if (max < min) return min;
+        return Math.min(Math.max(value, min), max);
+    }
+
+    function showSearchButton(rect, fallbackX, fallbackY) {
+        btn.style.display = 'block';
+        btn.style.visibility = 'hidden';
+
+        const buttonWidth = btn.offsetWidth || 120;
+        const buttonHeight = btn.offsetHeight || 40;
+        const viewportPadding = 8;
+        const minLeft = window.scrollX + viewportPadding;
+        const maxLeft = window.scrollX + window.innerWidth - buttonWidth - viewportPadding;
+        const minTop = window.scrollY + viewportPadding;
+        const maxTop = window.scrollY + window.innerHeight - buttonHeight - viewportPadding;
+
+        const baseLeft = rect
+            ? window.scrollX + rect.left + (rect.width / 2) - (buttonWidth / 2)
+            : fallbackX;
+        let baseTop = rect
+            ? window.scrollY + rect.bottom + 8
+            : fallbackY + 20;
+
+        if (rect && baseTop > maxTop) {
+            baseTop = window.scrollY + rect.top - buttonHeight - 8;
+        }
+
+        btn.style.left = clampPosition(baseLeft, minLeft, maxLeft) + 'px';
+        btn.style.top = clampPosition(baseTop, minTop, maxTop) + 'px';
+        btn.style.visibility = 'visible';
+    }
+
+    function updateSearchButton(fallbackX = window.scrollX + 20, fallbackY = window.scrollY + 20) {
+        const selection = window.getSelection();
+        const selectionText = getSelectionText();
+
+        // 限制選取長度，避免選取整面文字時誤觸。
+        if (!selectionText || selectionText.length >= 150 || isSelectionInsideTool(selection)) {
+            btn.style.display = 'none';
+            return;
+        }
+
+        showSearchButton(getSelectionRect(selection), fallbackX, fallbackY);
+    }
+
     // 滑鼠選取監聽
     document.addEventListener('mouseup', (e) => {
-        setTimeout(() => {
-            const selection = window.getSelection().toString().trim();
-            // 限制選取長度，避免選取整面文字時誤觸
-            if (selection.length > 0 && selection.length < 150) {
-                btn.style.left = e.pageX + 'px';
-                btn.style.top = (e.pageY + 20) + 'px';
-                btn.style.display = 'block';
-            } else {
-                btn.style.display = 'none';
-            }
-        }, 50);
+        setTimeout(() => updateSearchButton(e.pageX, e.pageY), 50);
+    });
+
+    document.addEventListener('selectionchange', () => {
+        setTimeout(() => updateSearchButton(), 80);
     });
 
     function getCsvResults(text) {
@@ -362,7 +535,7 @@
         }));
     }
 
-    function renderList(listContent, state, items, renderItem) {
+    function renderList(listContent, state, items, renderItem, message = '') {
         if (state === 'loading') {
             listContent.insertAdjacentHTML('beforeend', '<li class="csv-empty">查詢中...</li>');
             return;
@@ -374,7 +547,8 @@
         }
 
         if (state === 'error') {
-            listContent.insertAdjacentHTML('beforeend', '<li class="csv-empty">查詢失敗，請確認網址、權限或 @connect 設定。</li>');
+            const detail = message ? `：${escapeHtml(message)}` : '，請確認網址、權限或 @connect 設定。';
+            listContent.insertAdjacentHTML('beforeend', `<li class="csv-empty">查詢失敗${detail}</li>`);
             return;
         }
 
@@ -432,7 +606,7 @@
         }
 
         if (isOpdsMode()) {
-            renderList(listContent, opdsState.state, opdsState.items, createOpdsItem);
+            renderList(listContent, opdsState.state, opdsState.items, createOpdsItem, opdsState.message);
         }
     }
 
@@ -445,7 +619,7 @@
     // 搜尋動作
     btn.addEventListener('mousedown', async (e) => {
         e.preventDefault();
-        const text = window.getSelection().toString().trim();
+        const text = getSelectionText();
         const csvResults = isCsvMode() ? getCsvResults(text) : [];
 
         if (!isCsvMode() && !isOpdsMode()) return;
