@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         書庫數據比對工具
 // @namespace    http://tampermonkey.net/
-// @version      1.10
+// @version      1.11
 // @description  選取文字後使用 CSV 或 OPDS 查詢書庫資料
 // @author       Gemini
 // @match        *://*/*
@@ -437,20 +437,20 @@
     panel.querySelector('.csv-close').onclick = () => panel.style.display = 'none';
 
     // 視窗拖拽功能
-    let isDragging = false, offset = { x: 0, y: 0 };
     const handle = panel.querySelector('#csv-drag-handle');
-    handle.onmousedown = (e) => {
-        isDragging = true;
-        offset.x = e.clientX - panel.offsetLeft;
-        offset.y = e.clientY - panel.offsetTop;
-    };
-    document.onmousemove = (e) => {
-        if (isDragging) {
-            panel.style.left = (e.clientX - offset.x) + 'px';
-            panel.style.top = (e.clientY - offset.y) + 'px';
-        }
-    };
-    document.onmouseup = () => isDragging = false;
+    let offsetX, offsetY;
+    handle.addEventListener('pointerdown', (e) => {
+        if (!e.isPrimary || e.button !== 0 || e.target.closest('.csv-close')) return;
+        offsetX = e.clientX - panel.offsetLeft;
+        offsetY = e.clientY - panel.offsetTop;
+        // 只在拖曳標題列時接收移動事件，放開或取消後由瀏覽器釋放。
+        handle.setPointerCapture(e.pointerId);
+    });
+    handle.addEventListener('pointermove', (e) => {
+        if (!handle.hasPointerCapture(e.pointerId)) return;
+        panel.style.left = (e.clientX - offsetX) + 'px';
+        panel.style.top = (e.clientY - offsetY) + 'px';
+    });
 
     function getSelectionText() {
         return window.getSelection()?.toString().trim() || '';
@@ -518,13 +518,11 @@
         showSearchButton(getSelectionRect(selection), fallbackX, fallbackY);
     }
 
-    // 滑鼠選取監聽
-    document.addEventListener('mouseup', (e) => {
-        setTimeout(() => updateSearchButton(e.pageX, e.pageY), 50);
-    });
-
+    // 選取持續變動時延後更新，避免拖選途中顯示按鈕。
+    let selectionTimer;
     document.addEventListener('selectionchange', () => {
-        setTimeout(() => updateSearchButton(), 80);
+        clearTimeout(selectionTimer);
+        selectionTimer = setTimeout(updateSearchButton, 150);
     });
 
     function getCsvResults(text) {
